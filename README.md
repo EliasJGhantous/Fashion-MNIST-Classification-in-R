@@ -2,7 +2,7 @@
 
 This is one part of a final project submitted for the STAT 154 "Modern Statistical Prediction and Machine Learning" class I completed at UC Berkeley.
 
-The Fashion MNIST dataset is a popular and novel image dataset used for benchmarking machine learning models and training classification algorithms.
+The Fashion MNIST dataset is a popular and novel image dataset used for benchmarking machine learning models and training classification algorithms. It can be downloaded freely online.
 
 The dataset contains 18,000 different 28×28 grayscale images of clothing, each with a label of either shoes, shirt, or pants (6000 of each). If we stack the features into a single vector, we can transform each of these observations into a single 28∗28 = 784 dimensional vector. 
 
