@@ -1,0 +1,507 @@
+---
+title: "Fashion MNIST"
+author: "Elias Junior Ghantous and Sebastian Bigelow-Mirmiran"
+date: "December 12, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(FactoMineR)
+library(RColorBrewer)
+library(caret)
+library(pROC)
+library(gbm)
+library(e1071)
+```
+
+```{r}
+FMNIST <- read_csv("FashionMNIST.csv")
+y <- FMNIST$label
+y[y == 0] <- "shirt"
+y[y == 1] <- "pant"
+y[y == 2] <- "shoe"
+X <- subset(FMNIST, select = -c(label))
+rm('FMNIST')
+set.seed(12345)
+```
+
+### Exploratory PCA
+```{r}
+PCA_results <- PCA(X, ncp = ncol(X))
+
+screeplot_data <- as.data.frame(PCA_results$eig)
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,3])) + geom_line() + theme_bw() + ylab("Cumulative Variance Explained") + xlab("Component") + ggtitle("Screeplot Of Cumulative Variance")
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,1])) + geom_line() + theme_bw() + ylab("Eigenvalue") + xlab("Component") + ggtitle("Screeplot Of Eigenvalues")
+```
+
+#### Making Sense of PCA (Transforming the Data)
+```{r}
+# transforming eigenvalues
+loadings <- sweep(PCA_results$var$coord,2,sqrt(PCA_results$eig[1:ncol(PCA_results$var$coord),1]),FUN="/")
+
+# making sense of loadings
+loadings <- abs(loadings)
+loading_sums <- rowSums(loadings)
+loadings_df <- cbind(loading_sums, c(1:length(loading_sums)))
+loadings_df <- loadings_df[order(-loading_sums),]
+colnames(loadings_df) <- c("loading sum", "columnnumber")
+
+# finding the most significant columns from PCA
+top_pic_pixels <- head(loadings_df[,2], 200)
+X_compressed <- X[,sort(top_pic_pixels, decreasing = FALSE)]
+```
+We selected the top 200 pixels as that was a significant reduction in dimensionality while still being able to distinguish between classes visually. The 200 mark is one in general that explains around 95% of the variance.
+
+### Visualizing Images After PCA
+
+In order to make the images as identifiable as possible, we used a colour scale that includes 9 colours and replaced all null values with NA. This allowed us to identify which pixels of the original image were the result of PCA analysis i.e. the most significant pixels.
+```{r}
+# shoe
+X2 <- as.numeric(X[1,])
+X2[-top_pic_pixels] <- NA
+X2 <- matrix(X2, ncol=28, nrow=28, byrow = TRUE)
+X2 <- apply(X2, 2, rev)
+image(1:28, 1:28,t(X2), col = brewer.pal(n = 9, name = "YlOrRd"), main='Class 2 (Shoes)')
+
+# shirt
+X0 <- as.numeric(X[2,])
+X0[-top_pic_pixels] <- NA
+X0 <- matrix(X0, ncol=28, nrow=28, byrow = TRUE)
+X0 <- apply(X0, 2, rev)
+image(1:28, 1:28,t(X0), col = brewer.pal(n = 9, name = "YlOrRd"), main='Class 0 (Shirts)')
+
+# pants
+
+X1 <- as.numeric(X[8,])
+X1[-top_pic_pixels] <- NA
+X1 <- matrix(X1, ncol=28, nrow=28, byrow = TRUE)
+X1 <- apply(X1, 2, rev)
+image(1:28, 1:28,t(X1), col = brewer.pal(n = 9, name = "YlOrRd"), main='Class 1 (Pants)')
+```
+
+To try and find the lowest dimensionality that allows us to still visually distinguish between the three classes, we tested at lower dimensions. We found that the minimum was 100 pixels. This does, however, make it difficult to distinguish pants from shirts correctly every time.
+```{r}
+top_pic_pixels <- head(loadings_df[,2], 100)
+X_compressed <- X[,sort(top_pic_pixels, decreasing = FALSE)]
+
+# shoe
+X2 <- as.numeric(X[1,])
+X2[-top_pic_pixels] <- NA
+X2 <- matrix(X2, ncol=28, nrow=28, byrow = TRUE)
+X2 <- apply(X2, 2, rev)
+image(1:28, 1:28,t(X2), col = brewer.pal(n = 9, name = "YlOrRd"), main='Class 2 (Shoes)')
+
+# shirt
+X0 <- as.numeric(X[2,])
+X0[-top_pic_pixels] <- NA
+X0 <- matrix(X0, ncol=28, nrow=28, byrow = TRUE)
+X0 <- apply(X0, 2, rev)
+image(1:28, 1:28,t(X0), col = brewer.pal(n = 9, name = "YlOrRd"), main='Class 0 (Shirts)')
+
+# pants
+
+X1 <- as.numeric(X[8,])
+X1[-top_pic_pixels] <- NA
+X1 <- matrix(X1, ncol=28, nrow=28, byrow = TRUE)
+X1 <- apply(X1, 2, rev)
+image(1:28, 1:28,t(X1), col = brewer.pal(n = 9, name = "YlOrRd"), main='Class 1 (Pants)')
+```
+
+### Binary Classification
+
+#### Shoes VS Shirts
+```{r}
+shoes_shirts <- which(y %in% c("shoe","shirt"))
+holdout_shoes_shirts_split <- sample.int(length(shoes_shirts)*0.2)
+holdout_shoes_shirts <- shoes_shirts[holdout_shoes_shirts_split]
+shoes_shirts <- shoes_shirts[-holdout_shoes_shirts_split]
+shoes_shirts_train_split <- sample.int(length(shoes_shirts)*0.8)
+shoes_shirts_train <- shoes_shirts[shoes_shirts_train_split]
+shoes_shirts_test <- shoes_shirts[-shoes_shirts_train_split]
+
+# running PCA on training set
+PCA_results <- PCA(X[shoes_shirts_train,], ncp = ncol(X))
+
+screeplot_data <- as.data.frame(PCA_results$eig)
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,3])) + geom_line() + theme_bw() + ylab("Cumulative Variance Explained") + xlab("Component") + ggtitle("Screeplot Of Cumulative Variance")
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,1])) + geom_line() + theme_bw() + ylab("Eigenvalue") + xlab("Component") + ggtitle("Screeplot Of Eigenvalues")
+
+# making sense of eigenvalues
+loadings <- sweep(PCA_results$var$coord,2,sqrt(PCA_results$eig[1:ncol(PCA_results$var$coord),1]),FUN="/")
+
+# making sense of loadings
+loadings <- abs(loadings)
+loading_sums <- rowSums(loadings)
+loadings_df <- cbind(loading_sums, c(1:length(loading_sums)))
+loadings_df <- loadings_df[order(-loading_sums),]
+colnames(loadings_df) <- c("loading sum", "columnnumber")
+
+# finding most significant pixels
+top_pic_pixels <- head(loadings_df[,2], 200)
+X_compressed <- X[,sort(top_pic_pixels, decreasing = FALSE)]
+
+shoes_shirts_train_X <- X_compressed[shoes_shirts_train,]
+shoes_shirts_test_X <- X_compressed[shoes_shirts_test,]
+
+shoes_shirts_train_y <- as.factor(y[shoes_shirts_train])
+shoes_shirts_test_y <- as.factor(y[shoes_shirts_test])
+
+shoes_shirts_holdout_X <- X_compressed[holdout_shoes_shirts,]
+shoes_shirts_holdout_y <- as.factor(y[holdout_shoes_shirts])
+
+trainingData <- cbind.data.frame(shoes_shirts_train_X, shoes_shirts_train_y)
+testingData <- cbind.data.frame(shoes_shirts_test_X, shoes_shirts_test_y)
+```
+
+##### Gradient Boosted Machines Model With Cross-Validation
+```{r}
+objControl <- trainControl(method='cv', number=3, returnResamp='none', summaryFunction = twoClassSummary, classProbs = TRUE)
+
+objModel <- train(shoes_shirts_train_X, shoes_shirts_train_y, 
+                  method='gbm', 
+                  trControl = objControl,  
+                  metric = "ROC")
+
+objModel
+
+predictions <- predict(object=objModel, shoes_shirts_test_X, type='raw')
+head(predictions)
+
+print(postResample(pred=predictions, obs=as.factor(shoes_shirts_test_y)))
+
+predictions <- predict(object=objModel, shoes_shirts_test_X, type='prob')
+head(predictions)
+```
+The best model using GBM is the one with 150 trees and a depth of 3. The accuracy, however, is very high for all of the GBM models possible after cross-validation.
+
+##### Logistic Classification Model
+```{r}
+logitMod <- glm(shoes_shirts_train_y ~ ., data=trainingData, family=binomial(link="logit"), maxit = 100)
+
+fitted.results <- predict(logitMod,newdata=testingData,type='response')
+fitted.results <- ifelse(fitted.results > 0.5,"shoe","shirt")
+misClassificError <- mean(fitted.results != testingData$shoes_shirts_test_y)
+print(paste('Accuracy',1-misClassificError))
+```
+Accuracy of this model is also very high but the GBM model bests it.
+
+##### Final Model Testing With GBM
+
+We selected GBM as the ultimate best model. The following results are obtained using the untouched holdout set.
+```{r}
+colnames(trainingData)[ncol(trainingData)] <- c("label") 
+colnames(testingData)[ncol(testingData)] <- c("label")
+
+shoes_shirts_data_final <- rbind.data.frame(trainingData, testingData)
+shoes_shirts_data_final$label <- (as.numeric(shoes_shirts_data_final$label) - 1)
+#shirt is 0, shoe is 1
+shoes_shirts_holdout_final <- cbind.data.frame(shoes_shirts_holdout_X, shoes_shirts_holdout_y)
+colnames(shoes_shirts_holdout_final)[ncol(shoes_shirts_holdout_final)] <- c("label")
+
+model <- gbm(label ~ ., data = shoes_shirts_data_final, n.trees = 150, interaction.depth = 2)
+
+model.pred <- predict(model, shoes_shirts_holdout_final, n.trees = 150, type = "response")
+model.pred <- ifelse(model.pred < 0.5, "shirt", "shoe")
+model.pred <- as.factor(model.pred)
+confusionMatrix(model.pred, shoes_shirts_holdout_final$label)
+```
+
+#### Shoes VS Pants
+
+The following code is a repeat of that above, except this time for "shoes" and "pants".
+```{r}
+shoes_pants <- which(y %in% c("shoe","pant"))
+holdout_shoes_pants_split <- sample.int(length(shoes_pants)*0.2)
+holdout_shoes_pants <- shoes_pants[holdout_shoes_pants_split]
+shoes_pants <- shoes_pants[-holdout_shoes_pants_split]
+shoes_pants_train_split <- sample.int(length(shoes_pants)*0.8)
+shoes_pants_train <- shoes_pants[shoes_pants_train_split]
+shoes_pants_test <- shoes_pants[-shoes_pants_train_split]
+
+PCA_results <- PCA(X[shoes_pants_train,], ncp = ncol(X))
+
+screeplot_data <- as.data.frame(PCA_results$eig)
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,3])) + geom_line() + theme_bw() + ylab("Cumulative Variance Explained") + xlab("Component") + ggtitle("Screeplot Of Cumulative Variance")
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,1])) + geom_line() + theme_bw() + ylab("Eigenvalue") + xlab("Component") + ggtitle("Screeplot Of Eigenvalues")
+
+loadings <- sweep(PCA_results$var$coord,2,sqrt(PCA_results$eig[1:ncol(PCA_results$var$coord),1]),FUN="/")
+
+loadings <- abs(loadings)
+loading_sums <- rowSums(loadings)
+loadings_df <- cbind(loading_sums, c(1:length(loading_sums)))
+loadings_df <- loadings_df[order(-loading_sums),]
+colnames(loadings_df) <- c("loading sum", "columnnumber")
+
+top_pic_pixels <- head(loadings_df[,2], 200)
+X_compressed <- X[,sort(top_pic_pixels, decreasing = FALSE)]
+
+shoes_pants_train_X <- X_compressed[shoes_pants_train,]
+shoes_pants_test_X <- X_compressed[shoes_pants_test,]
+
+shoes_pants_train_y <- as.factor(y[shoes_pants_train])
+shoes_pants_test_y <- as.factor(y[shoes_pants_test])
+
+shoes_pants_holdout_X <- X_compressed[holdout_shoes_pants,]
+shoes_pants_holdout_y <- as.factor(y[holdout_shoes_pants])
+
+trainingData <- cbind.data.frame(shoes_pants_train_X, shoes_pants_train_y)
+testingData <- cbind.data.frame(shoes_pants_test_X, shoes_pants_test_y)
+```
+
+##### Gradient Boosted Machines Model with Cross-Validation
+```{r}
+objControl <- trainControl(method='cv', number=3, returnResamp='none', summaryFunction = twoClassSummary, classProbs = TRUE)
+
+objModel <- train(shoes_pants_train_X, shoes_pants_train_y, 
+                  method='gbm', 
+                  trControl = objControl,  
+                  metric = "ROC")
+
+objModel
+
+predictions <- predict(object=objModel, shoes_pants_test_X, type='raw')
+head(predictions)
+
+print(postResample(pred=predictions, obs=as.factor(shoes_pants_test_y)))
+
+predictions <- predict(object=objModel, shoes_pants_test_X, type='prob')
+head(predictions)
+```
+Once again, the best model is the one with 150 trees and an interaction depth of 3.
+
+##### Logistic Classification Model
+```{r}
+logitMod <- glm(shoes_pants_train_y ~ ., data=trainingData, family=binomial(link="logit"), maxit = 100)
+
+fitted.results <- predict(logitMod,newdata=testingData,type='response')
+fitted.results <- ifelse(fitted.results > 0.5,"shoe","pant")
+misClassificError <- mean(fitted.results != testingData$shoes_pants_test_y)
+print(paste('Accuracy',1-misClassificError))
+```
+Accuracy of this model is also very high but the GBM model bests it.
+
+##### Final Model Testing With GBM
+
+We selected GBM as the ultimate best model. The following results are obtained using the untouched holdout set.
+```{r}
+colnames(trainingData)[ncol(trainingData)] <- c("label") 
+colnames(testingData)[ncol(testingData)] <- c("label")
+
+shoes_pants_data_final <- rbind.data.frame(trainingData, testingData)
+shoes_pants_data_final$label <- (as.numeric(shoes_pants_data_final$label) - 1)
+#pant is 0, shoe is 1
+shoes_pants_holdout_final <- cbind.data.frame(shoes_pants_holdout_X, shoes_pants_holdout_y)
+colnames(shoes_pants_holdout_final)[ncol(shoes_pants_holdout_final)] <- c("label")
+
+model <- gbm(label ~ ., data = shoes_pants_data_final, n.trees = 150, interaction.depth = 2)
+
+model.pred <- predict(model, shoes_pants_holdout_final, n.trees = 150, type = "response")
+model.pred <- ifelse(model.pred < 0.5, "pant", "shoe")
+model.pred <- as.factor(model.pred)
+confusionMatrix(model.pred, shoes_pants_holdout_final$label)
+```
+
+#### Shirts VS Pants
+
+The following code is a repeat of that above, except this time for "shirts" and "pants".
+```{r}
+shirts_pants <- which(y %in% c("shirt","pant"))
+holdout_shirts_pants_split <- sample.int(length(shirts_pants)*0.2)
+holdout_shirts_pants <- shirts_pants[holdout_shirts_pants_split]
+shirts_pants <- shirts_pants[-holdout_shirts_pants_split]
+shirts_pants_train_split <- sample.int(length(shirts_pants)*0.8)
+shirts_pants_train <- shirts_pants[shirts_pants_train_split]
+shirts_pants_test <- shirts_pants[-shirts_pants_train_split]
+
+PCA_results <- PCA(X[shirts_pants_train,], ncp = ncol(X))
+
+screeplot_data <- as.data.frame(PCA_results$eig)
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,3])) + geom_line() + theme_bw() + ylab("Cumulative Variance Explained") + xlab("Component") + ggtitle("Screeplot Of Cumulative Variance")
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,1])) + geom_line() + theme_bw() + ylab("Eigenvalue") + xlab("Component") + ggtitle("Screeplot Of Eigenvalues")
+
+loadings <- sweep(PCA_results$var$coord,2,sqrt(PCA_results$eig[1:ncol(PCA_results$var$coord),1]),FUN="/")
+
+loadings <- abs(loadings)
+loading_sums <- rowSums(loadings)
+loadings_df <- cbind(loading_sums, c(1:length(loading_sums)))
+loadings_df <- loadings_df[order(-loading_sums),]
+colnames(loadings_df) <- c("loading sum", "columnnumber")
+
+top_pic_pixels <- head(loadings_df[,2], 200)
+X_compressed <- X[,sort(top_pic_pixels, decreasing = FALSE)]
+
+shirts_pants_train_X <- X_compressed[shirts_pants_train,]
+shirts_pants_test_X <- X_compressed[shirts_pants_test,]
+
+shirts_pants_train_y <- as.factor(y[shirts_pants_train])
+shirts_pants_test_y <- as.factor(y[shirts_pants_test])
+
+shirts_pants_holdout_X <- X_compressed[holdout_shirts_pants,]
+shirts_pants_holdout_y <- as.factor(y[holdout_shirts_pants])
+
+trainingData <- cbind.data.frame(shirts_pants_train_X, shirts_pants_train_y)
+testingData <- cbind.data.frame(shirts_pants_test_X, shirts_pants_test_y)
+```
+
+##### Gradient Boosted Machines Model with Cross-Validation
+```{r}
+objControl <- trainControl(method='cv', number=3, returnResamp='none', summaryFunction = twoClassSummary, classProbs = TRUE)
+
+objModel <- train(shirts_pants_train_X, shirts_pants_train_y, 
+                  method='gbm', 
+                  trControl = objControl,  
+                  metric = "ROC")
+
+objModel
+
+predictions <- predict(object=objModel, shirts_pants_test_X, type='raw')
+head(predictions)
+
+print(postResample(pred=predictions, obs=as.factor(shirts_pants_test_y)))
+
+predictions <- predict(object=objModel, shirts_pants_test_X, type='prob')
+head(predictions)
+```
+Once again, the best model is the one with 150 trees and an interaction depth of 3.
+
+##### Logistic Classification Model
+```{r}
+logitMod <- glm(shirts_pants_train_y ~ ., data=trainingData, family=binomial(link="logit"), maxit = 100)
+
+fitted.results <- predict(logitMod,newdata=testingData,type='response')
+fitted.results <- ifelse(fitted.results > 0.5,"shirt","pant")
+misClassificError <- mean(fitted.results != testingData$shirts_pants_test_y)
+print(paste('Accuracy',1-misClassificError))
+```
+Accuracy of this model is also very high but the GBM model bests it.
+
+##### Final Model Testing With GBM
+
+We selected GBM as the ultimate best model. The following results are obtained using the untouched holdout set.
+```{r}
+colnames(trainingData)[ncol(trainingData)] <- c("label") 
+colnames(testingData)[ncol(testingData)] <- c("label")
+
+shirts_pants_data_final <- rbind.data.frame(trainingData, testingData)
+shirts_pants_data_final$label <- (as.numeric(shirts_pants_data_final$label) - 1)
+#pant is 0, shirt is 1
+shirts_pants_holdout_final <- cbind.data.frame(shirts_pants_holdout_X, shirts_pants_holdout_y)
+colnames(shirts_pants_holdout_final)[ncol(shirts_pants_holdout_final)] <- c("label")
+
+model <- gbm(label ~ ., data = shirts_pants_data_final, n.trees = 150, interaction.depth = 2)
+
+model.pred <- predict(model, shirts_pants_holdout_final, n.trees = 150, type = "response")
+model.pred <- ifelse(model.pred < 0.5, "pant", "shirt")
+model.pred <- as.factor(model.pred)
+confusionMatrix(model.pred, shirts_pants_holdout_final$label)
+```
+
+###Multiclass Classification
+
+The following code is similar to the code for binary classification.
+```{r}
+all <- 1:length(y)
+holdout_all_split <- sample.int(length(y)*0.2)
+holdout_all <- all[holdout_all_split]
+all <- all[-holdout_all_split]
+all_train_split <- sample.int(length(all)*0.8)
+all_train <- all[all_train_split]
+all_test <- all[-all_train_split]
+
+PCA_results <- PCA(X[all_train,], ncp = ncol(X))
+
+loadings <- sweep(PCA_results$var$coord,2,sqrt(PCA_results$eig[1:ncol(PCA_results$var$coord),1]),FUN="/")
+
+screeplot_data <- as.data.frame(PCA_results$eig)
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,3])) + geom_line() + theme_bw() + ylab("Cumulative Variance Explained") + xlab("Component") + ggtitle("Screeplot Of Cumulative Variance")
+ggplot(data = screeplot_data, aes(x = 1:nrow(screeplot_data), y = screeplot_data[,1])) + geom_line() + theme_bw() + ylab("Eigenvalue") + xlab("Component") + ggtitle("Screeplot Of Eigenvalues")
+
+loadings <- abs(loadings)
+loading_sums <- rowSums(loadings)
+loadings_df <- cbind(loading_sums, c(1:length(loading_sums)))
+loadings_df <- loadings_df[order(-loading_sums),]
+colnames(loadings_df) <- c("loading sum", "columnnumber")
+
+top_pic_pixels <- head(loadings_df[,2], 200)
+X_compressed <- X[,sort(top_pic_pixels, decreasing = FALSE)]
+
+all_train_X <- X_compressed[all_train,]
+all_test_X <- X_compressed[all_test,]
+
+all_train_y <- as.factor(y[all_train])
+all_test_y <- as.factor(y[all_test])
+
+all_holdout_X <- X_compressed[holdout_all,]
+all_holdout_y <- as.factor(y[holdout_all])
+
+trainingData <- cbind.data.frame(all_train_X, all_train_y)
+testingData <- cbind.data.frame(all_test_X, all_test_y)
+```
+
+##### Gradient Boosted Machines Model with Cross-Validation
+```{r}
+objControl <- trainControl(method='cv', number=3, classProbs = TRUE)
+
+objModel <- train(all_train_y ~ .,
+                  data = trainingData, 
+                  method='gbm', 
+                  trControl = objControl,  
+                  metric = "ROC")
+
+objModel
+
+predictions <- predict(object=objModel, all_test_X, type='raw')
+head(predictions)
+
+print(postResample(pred=predictions, obs=as.factor(all_test_y)))
+
+predictions <- predict(object=objModel, all_test_X, type='prob')
+head(predictions)
+```
+The accuracy, just like the binary models, is best for 150 trees and interaction depth of 3.
+
+##### Support Vector Machines Model
+```{r}
+colnames(trainingData)[ncol(trainingData)] <- c("label") 
+colnames(testingData)[ncol(testingData)] <- c("label")
+
+svm_model <- svm(label ~ ., data=trainingData, 
+          method="C-classification", kernel="radial")
+
+summary(svm_model)
+
+prediction <- predict(svm_model, testingData)
+
+confusionMatrix(prediction, testingData$label)
+```
+The accuracy for this model is another very high result, however it still doesn't beat the best GBM model.
+
+#### Combining Three Binary Models To Predict Multiclass
+
+In order to do this, one must repeat the binary classification code above for splitting the data and making the model. However, PCA must be run first on the full data set just like the most recent PCA for multiclass classification. That way, the PCA results transform the full dataset and then each binary model is built afterwards using the same dataset predictor variables. After that, run the test set entries on each model and output a matrix of responses. For each row in the matrix, it would have 3 columns, one for each model prediction. The most common prediction per row is the ultimate prediction in the end of the multiclass model. Then make a confusion matrix to test the accuracy. 
+
+#### Final Model Testing With GBM
+
+We selected GBM as the ultimate best model. The following results are obtained using the untouched holdout set
+```{r}
+all_data_final <- rbind.data.frame(trainingData, testingData)
+all_holdout_final <- cbind.data.frame(all_holdout_X, all_holdout_y)
+colnames(all_holdout_final)[ncol(all_holdout_final)] <- c("label")
+
+model <- gbm(label ~ ., data = all_data_final, n.trees = 150, interaction.depth = 3)
+
+model.pred <- predict(model, all_holdout_final, n.trees = 150, type = "response")
+model.pred <- matrix(model.pred, ncol = 3)
+colnames(model.pred) <- c("pant", "shirt", "shoe")
+model.pred <- as.factor(colnames(model.pred)[max.col(model.pred)])
+confusionMatrix(model.pred, all_holdout_final$label)
+```
+
+With our final selected model, the predictions on the test set yield an ultimate accuracy of roughly 99% which is due to the large number of trees used in the boosting of the algorithm and the PCA which we use to let the algorithm focus on the most significant pixels across the entire dataset. Looking at the dataset as a whole, we understand intuitively that there is a large difference between, for example, a shoe and a shirt or pants and a shirt. Therefore, it seems reasonable that a sufficiently soffisticated model should be able to accurately and consistently sort through these various clothing items. If, perhaps, we had trained this model on a wider variety of clothing items, such as different types of shoes or shirts and such, the result would not have been quite as effective.
